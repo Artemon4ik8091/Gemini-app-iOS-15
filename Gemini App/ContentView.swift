@@ -1,7 +1,7 @@
 import SwiftUI
 import Combine
 import UniformTypeIdentifiers
-
+import UIKit // Добавлено для работы с UIPasteboard
 
 // MARK: - Модели данных
 
@@ -24,7 +24,7 @@ struct ChatAttachment: Identifiable, Codable, Equatable {
 struct ChatMessage: Identifiable, Codable, Equatable {
     var id = UUID()
     let role: MessageRole
-    let content: String
+    var content: String
     let timestamp: Date
     var attachments: [ChatAttachment]? // Массив прикрепленных файлов к сообщению
     
@@ -42,11 +42,28 @@ struct ChatSession: Identifiable, Codable, Equatable {
     let createdAt: Date
 }
 
+/// Структура сохраненного системного промпта
+struct SavedPrompt: Identifiable, Codable, Equatable {
+    var id = UUID()
+    let title: String
+    let text: String
+}
+
 
 // MARK: - Модели для работы с Gemini API
 
 struct GeminiRequest: Codable {
     let contents: [GeminiContent]
+    let systemInstruction: GeminiSystemInstruction?
+    let generationConfig: GeminiGenerationConfig?
+}
+
+struct GeminiSystemInstruction: Codable {
+    let parts: [GeminiPart]
+}
+
+struct GeminiGenerationConfig: Codable {
+    let temperature: Double?
 }
 
 struct GeminiContent: Codable {
@@ -95,9 +112,26 @@ let availableModels = [
 
 class ChatViewModel: ObservableObject {
     @Published var sessions: [ChatSession] = []
+    @Published var savedPrompts: [SavedPrompt] = []
     @Published var currentSessionId: UUID?
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
+    
+    // Стейты для плавного появления текста (эффект печатной машинки)
+    @Published var isTyping: Bool = false
+    private var textBuffer: String = ""
+    private var displayTask: Task<Void, Never>?
+    
+    // Статус валидации API-ключа для отображения в настройках
+    @Published var keyValidationStatus: KeyStatus = .unchecked
+    @Published var isCheckingKey: Bool = false
+    
+    enum KeyStatus: Equatable {
+        case unchecked
+        case valid
+        case invalid(reason: String)
+        case rateLimited(reason: String)
+    }
     
     // API-ключ сохраняется в защищенном хранилище UserDefaults
     @AppStorage("gemini_api_key") var apiKey: String = ""
@@ -105,10 +139,16 @@ class ChatViewModel: ObservableObject {
     // Выбранная по умолчанию модель
     @AppStorage("gemini_selected_model") var selectedModel: String = "gemini-3.5-flash"
     
-    private let userDefaultsKey = "gemini_chat_sessions"
+    // Настройки генерации
+    @AppStorage("gemini_temperature") var temperature: Double = 0.7
+    @AppStorage("gemini_system_prompt") var systemPrompt: String = ""
+    
+    private let userDefaultsSessionsKey = "gemini_chat_sessions"
+    private let userDefaultsPromptsKey = "gemini_saved_prompts"
     
     init() {
         loadSessions()
+        loadSavedPrompts()
         if sessions.isEmpty {
             createNewSession()
         } else {
@@ -124,7 +164,7 @@ class ChatViewModel: ObservableObject {
     
     /// Загрузка сессий из памяти устройства
     func loadSessions() {
-        guard let data = UserDefaults.standard.data(forKey: userDefaultsKey) else { return }
+        guard let data = UserDefaults.standard.data(forKey: userDefaultsSessionsKey) else { return }
         if let decoded = try? JSONDecoder().decode([ChatSession].self, from: data) {
             self.sessions = decoded
         }
@@ -133,7 +173,32 @@ class ChatViewModel: ObservableObject {
     /// Сохранение сессий на устройство
     func saveSessions() {
         if let encoded = try? JSONEncoder().encode(sessions) {
-            UserDefaults.standard.set(encoded, forKey: userDefaultsKey)
+            UserDefaults.standard.set(encoded, forKey: userDefaultsSessionsKey)
+        }
+    }
+    
+    /// Загрузка сохраненных системных промптов
+    func loadSavedPrompts() {
+        guard let data = UserDefaults.standard.data(forKey: userDefaultsPromptsKey) else { return }
+        if let decoded = try? JSONDecoder().decode([SavedPrompt].self, from: data) {
+            self.savedPrompts = decoded
+        }
+    }
+    
+    /// Сохранение нового системного промпта
+    func saveNewPrompt(title: String, text: String) {
+        let newPrompt = SavedPrompt(title: title, text: text)
+        savedPrompts.append(newPrompt)
+        if let encoded = try? JSONEncoder().encode(savedPrompts) {
+            UserDefaults.standard.set(encoded, forKey: userDefaultsPromptsKey)
+        }
+    }
+    
+    /// Удаление системного промпта
+    func deleteSavedPrompt(at offsets: IndexSet) {
+        savedPrompts.remove(atOffsets: offsets)
+        if let encoded = try? JSONEncoder().encode(savedPrompts) {
+            UserDefaults.standard.set(encoded, forKey: userDefaultsPromptsKey)
         }
     }
     
@@ -182,6 +247,78 @@ class ChatViewModel: ObservableObject {
         }
     }
     
+    /// Проверка действия и ограничений API-ключа
+    func validateApiKey(_ keyToCheck: String) async {
+        let trimmedKey = keyToCheck.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else {
+            await MainActor.run {
+                self.keyValidationStatus = .invalid(reason: "Ключ не может быть пустым.")
+            }
+            return
+        }
+        
+        await MainActor.run {
+            self.isCheckingKey = true
+            self.keyValidationStatus = .unchecked
+        }
+        
+        // Легковесный тестовый GET-запрос для быстрой валидации ключа и его лимитов
+        let urlString = "https://generativelanguage.googleapis.com/v1beta/models?key=\(trimmedKey)"
+        guard let url = URL(string: urlString) else {
+            await MainActor.run {
+                self.isCheckingKey = false
+                self.keyValidationStatus = .invalid(reason: "Некорректный формат URL проверки.")
+            }
+            return
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw URLError(.badServerResponse)
+            }
+            
+            if httpResponse.statusCode == 200 {
+                await MainActor.run {
+                    self.isCheckingKey = false
+                    self.keyValidationStatus = .valid
+                }
+            } else {
+                var parsedErrorMessage = "Код ошибки: \(httpResponse.statusCode)"
+                var errorStatusString = ""
+                
+                if let errorJSON = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let errorDetails = errorJSON["error"] as? [String: Any] {
+                    if let message = errorDetails["message"] as? String {
+                        parsedErrorMessage = message
+                    }
+                    if let status = errorDetails["status"] as? String {
+                        errorStatusString = status
+                    }
+                }
+                
+                await MainActor.run {
+                    self.isCheckingKey = false
+                    
+                    if httpResponse.statusCode == 429 || errorStatusString == "RESOURCE_EXHAUSTED" {
+                        self.keyValidationStatus = .rateLimited(reason: "Лимит запросов исчерпан. Пожалуйста, подождите или смените тариф ключа (Бесплатный лимит: 15 RPM). Подробнее: \(parsedErrorMessage)")
+                    } else {
+                        self.keyValidationStatus = .invalid(reason: "Ошибка проверки ключа! Проверьте правильность ввода. \(parsedErrorMessage)")
+                    }
+                }
+            }
+        } catch {
+            await MainActor.run {
+                self.isCheckingKey = false
+                self.keyValidationStatus = .invalid(reason: "Ошибка соединения: \(error.localizedDescription)")
+            }
+        }
+    }
     
     /// Отправка сообщения в Gemini
     func sendMessage(text: String, attachments: [ChatAttachment]) async {
@@ -198,26 +335,36 @@ class ChatViewModel: ObservableObject {
         
         guard let sessionIndex = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
         
-        // 1. Создаем и добавляем сообщение пользователя локально (включая ссылки на вложения)
+        // 1. Создаем сообщение пользователя локально
         let userMessage = ChatMessage(role: .user, content: trimmedText, timestamp: Date(), attachments: attachments)
         
+        // 2. Подготавливаем историю диалога для API (до добавления плейсхолдера для ответа)
+        let apiMessages = prepareApiMessages(for: sessionIndex, adding: userMessage)
+        
+        // Подготавливаем ID для будущего ответа модели
+        let modelMessageId = UUID()
+        
         await MainActor.run {
+            // Добавляем сообщение пользователя в UI
             self.sessions[sessionIndex].messages.append(userMessage)
+            
             // Автоматическое переименование пустого чата по первому сообщению
             if self.sessions[sessionIndex].title.hasPrefix("Новый чат") {
                 let preview = trimmedText.isEmpty ? "Файл/Изображение" : String(trimmedText.prefix(25))
                 self.sessions[sessionIndex].title = preview + (trimmedText.count > 25 ? "..." : "")
             }
+            
+            // Сразу добавляем пустой баббл для стриминга ответа
+            let placeholderMessage = ChatMessage(id: modelMessageId, role: .model, content: "", timestamp: Date(), attachments: nil)
+            self.sessions[sessionIndex].messages.append(placeholderMessage)
+            
             self.isLoading = true
             self.errorMessage = nil
             self.saveSessions()
         }
         
-        // 2. Формируем историю диалога и вложения для мультимодального запроса к API
-        let apiMessages = prepareApiMessages(for: sessionIndex)
-        
-        // 3. Выполняем сетевой запрос
-        await executeApiCall(apiMessages: apiMessages, sessionIndex: sessionIndex)
+        // 3. Выполняем сетевой запрос (стриминг)
+        await executeApiCall(apiMessages: apiMessages, sessionIndex: sessionIndex, targetMessageId: modelMessageId)
     }
     
     /// Повторная отправка последнего сообщения при возникновении ошибки
@@ -230,24 +377,43 @@ class ChatViewModel: ObservableObject {
         }
         
         guard let sessionIndex = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
-        // Проверяем, что последнее сообщение было отправлено пользователем (именно его мы и пытаемся повторить)
-        guard let lastMessage = sessions[sessionIndex].messages.last, lastMessage.role == .user else { return }
+        
+        // Если последнее сообщение от модели (прерванное/с ошибкой), удаляем его
+        if let lastMsg = sessions[sessionIndex].messages.last, lastMsg.role == .model {
+            await MainActor.run {
+                self.sessions[sessionIndex].messages.removeLast()
+            }
+        }
+        
+        // Убеждаемся, что теперь последнее сообщение было отправлено пользователем
+        guard sessions[sessionIndex].messages.last?.role == .user else { return }
+        
+        // Формируем историю диалога на основе текущих сообщений
+        let apiMessages = prepareApiMessages(for: sessionIndex, adding: nil)
+        
+        let modelMessageId = UUID()
         
         await MainActor.run {
             self.isLoading = true
             self.errorMessage = nil
+            
+            // Добавляем пустой плейсхолдер для нового ответа
+            let placeholderMessage = ChatMessage(id: modelMessageId, role: .model, content: "", timestamp: Date(), attachments: nil)
+            self.sessions[sessionIndex].messages.append(placeholderMessage)
         }
         
-        // Формируем историю диалога на основе текущих сообщений
-        let apiMessages = prepareApiMessages(for: sessionIndex)
-        
         // Повторно запускаем сетевой запрос
-        await executeApiCall(apiMessages: apiMessages, sessionIndex: sessionIndex)
+        await executeApiCall(apiMessages: apiMessages, sessionIndex: sessionIndex, targetMessageId: modelMessageId)
     }
     
     /// Вспомогательный метод формирования массива объектов для API Gemini
-    private func prepareApiMessages(for sessionIndex: Int) -> [GeminiContent] {
-        return sessions[sessionIndex].messages.map { msg -> GeminiContent in
+    private func prepareApiMessages(for sessionIndex: Int, adding newMessage: ChatMessage?) -> [GeminiContent] {
+        var allMessages = sessions[sessionIndex].messages
+        if let newMsg = newMessage {
+            allMessages.append(newMsg)
+        }
+        
+        return allMessages.map { msg -> GeminiContent in
             let apiRole = msg.role == .user ? "user" : "model"
             var parts: [GeminiPart] = []
             
@@ -277,16 +443,20 @@ class ChatViewModel: ObservableObject {
         }
     }
     
-    /// Общий метод для выполнения сетевого запроса к API Gemini
-    private func executeApiCall(apiMessages: [GeminiContent], sessionIndex: Int) async {
-        let requestBody = GeminiRequest(contents: apiMessages)
+    /// Выполнение потокового (SSE) сетевого запроса к API Gemini (iOS 15+)
+    private func executeApiCall(apiMessages: [GeminiContent], sessionIndex: Int, targetMessageId: UUID) async {
+        let sysInstruct = systemPrompt.isEmpty ? nil : GeminiSystemInstruction(parts: [GeminiPart(text: systemPrompt, inlineData: nil)])
+        let genConfig = GeminiGenerationConfig(temperature: temperature)
         
-        // Используем выбранную в настройках модель Gemini
-        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(selectedModel):generateContent?key=\(apiKey)"
+        let requestBody = GeminiRequest(contents: apiMessages, systemInstruction: sysInstruct, generationConfig: genConfig)
+        
+        // Используем эндпоинт streamGenerateContent для стриминга (с alt=sse)
+        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(selectedModel):streamGenerateContent?alt=sse&key=\(apiKey)"
         guard let url = URL(string: urlString) else {
             await MainActor.run {
                 self.isLoading = false
                 self.errorMessage = "Некорректный URL API"
+                self.sessions[sessionIndex].messages.removeAll(where: { $0.id == targetMessageId })
             }
             return
         }
@@ -295,43 +465,377 @@ class ChatViewModel: ObservableObject {
         request.httpMethod = "POST"
         request.addValue("application/json", forHTTPHeaderField: "Content-Type")
         
+        await MainActor.run {
+            self.textBuffer = ""
+            self.startSmoothTyping(sessionIndex: sessionIndex, messageId: targetMessageId)
+        }
+        
         do {
             request.httpBody = try JSONEncoder().encode(requestBody)
             
-            let (data, response) = try await URLSession.shared.data(for: request)
+            // Используем асинхронный байтовый стрим (доступно с iOS 15)
+            let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
             
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw URLError(.badServerResponse)
             }
             
+            // Если статус не 200, читаем все тело ответа, чтобы получить сообщение об ошибке
             if httpResponse.statusCode != 200 {
-                if let errorJSON = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let errorDetails = errorJSON["error"] as? [String: Any],
-                   let message = errorDetails["message"] as? String {
-                    throw NSError(domain: "GeminiError", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: message])
+                var errorData = Data()
+                for try await byte in asyncBytes {
+                    errorData.append(byte)
                 }
-                throw URLError(.badServerResponse)
+                
+                var detailedError = "Ошибка сервера (Код \(httpResponse.statusCode))"
+                var statusString = ""
+                
+                if let errorJSON = try? JSONSerialization.jsonObject(with: errorData) as? [String: Any],
+                   let errorDetails = errorJSON["error"] as? [String: Any] {
+                    if let message = errorDetails["message"] as? String {
+                        detailedError = message
+                    }
+                    if let status = errorDetails["status"] as? String {
+                        statusString = status
+                    }
+                }
+                
+                if httpResponse.statusCode == 429 || statusString == "RESOURCE_EXHAUSTED" {
+                    throw NSError(domain: "GeminiError", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "Превышен лимит запросов в минуту (Rate Limit). Пожалуйста, подождите немного перед отправкой следующего сообщения."])
+                } else if httpResponse.statusCode == 400 && detailedError.contains("API key") {
+                    throw NSError(domain: "GeminiError", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "Указан недействительный API-ключ. Проверьте настройки приложения."])
+                } else {
+                    throw NSError(domain: "GeminiError", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: detailedError])
+                }
             }
             
-            let decodedResponse = try JSONDecoder().decode(GeminiResponse.self, from: data)
+            var hasReceivedContent = false
             
-            guard let modelReply = decodedResponse.candidates?.first?.content?.parts.first?.text else {
-                throw NSError(domain: "GeminiError", code: 0, userInfo: [NSLocalizedDescriptionKey: "Пустой ответ от модели"])
+            // Читаем поток по строкам (SSE)
+            for try await line in asyncBytes.lines {
+                guard line.hasPrefix("data: ") else { continue }
+                
+                let jsonString = String(line.dropFirst(6))
+                
+                if jsonString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+                if jsonString == "[DONE]" { break } // Маркер завершения стрима
+                
+                if let data = jsonString.data(using: .utf8) {
+                    let decodedResponse = try JSONDecoder().decode(GeminiResponse.self, from: data)
+                    
+                    if let textPiece = decodedResponse.candidates?.first?.content?.parts.first?.text {
+                        hasReceivedContent = true
+                        // Добавляем текст в буфер для плавного рендеринга
+                        await MainActor.run {
+                            self.textBuffer += textPiece
+                        }
+                    }
+                }
+            }
+            
+            if !hasReceivedContent {
+                throw NSError(domain: "GeminiError", code: 0, userInfo: [NSLocalizedDescriptionKey: "Пустой ответ от модели. Попробуйте еще раз или проверьте параметры."])
             }
             
             await MainActor.run {
-                let replyMessage = ChatMessage(role: .model, content: modelReply, timestamp: Date(), attachments: nil)
-                self.sessions[sessionIndex].messages.append(replyMessage)
                 self.isLoading = false
-                self.saveSessions()
             }
             
         } catch {
             await MainActor.run {
                 self.isLoading = false
                 self.errorMessage = error.localizedDescription
+                // Если произошла ошибка до получения текста, удаляем пустой баббл
+                if let msgIndex = self.sessions[sessionIndex].messages.firstIndex(where: { $0.id == targetMessageId }),
+                   self.sessions[sessionIndex].messages[msgIndex].content.isEmpty {
+                    self.sessions[sessionIndex].messages.remove(at: msgIndex)
+                }
             }
         }
+    }
+    
+    /// Запуск цикла плавного посимвольного вывода текста (эффект печатной машинки)
+    private func startSmoothTyping(sessionIndex: Int, messageId: UUID) {
+        displayTask?.cancel()
+        
+        displayTask = Task { @MainActor in
+            self.isTyping = true
+            
+            while !Task.isCancelled {
+                if !self.textBuffer.isEmpty {
+                    // Используем фиксированную скорость (2 символа за такт) для плавности
+                    // При большом накоплении буфера пропорционально увеличиваем порцию, чтобы не отставать
+                    let takeCount = max(2, self.textBuffer.count / 8)
+                    let chunk = String(self.textBuffer.prefix(takeCount))
+                    self.textBuffer.removeFirst(chunk.count)
+                    
+                    if let msgIndex = self.sessions[sessionIndex].messages.firstIndex(where: { $0.id == messageId }) {
+                        self.sessions[sessionIndex].messages[msgIndex].content += chunk
+                    }
+                } else if !self.isLoading {
+                    // Сетевой запрос завершен и буфер пуст
+                    break
+                }
+                
+                // Задержка ~30 мс для частоты обновления ~33 кадра в секунду
+                try? await Task.sleep(nanoseconds: 30_000_000)
+            }
+            
+            self.isTyping = false
+            self.saveSessions()
+        }
+    }
+}
+
+
+// MARK: - Парсинг и Рендеринг Markdown (iOS 15+)
+
+/// Типы блоков, на которые разделяется входящее сообщение (кастомный структурный парсер)
+enum MarkdownBlock: Identifiable, Equatable {
+    var id: UUID { UUID() }
+    
+    case text(AttributedString)
+    case header(text: AttributedString, level: Int)
+    case quote(AttributedString)
+    case codeBlock(code: String, language: String)
+    case divider
+}
+
+/// Продвинутый кастомный парсер Markdown, исправляющий ограничения встроенного парсера iOS 15
+struct MarkdownParser {
+    
+    /// Парсит исходный текст в массив красивых визуальных блоков (заголовки, цитаты, код, текст)
+    static func parse(_ text: String) -> [MarkdownBlock] {
+        var blocks: [MarkdownBlock] = []
+        let lines = text.components(separatedBy: .newlines)
+        
+        var currentTextLines: [String] = []
+        var currentQuoteLines: [String] = []
+        var isInsideCodeBlock = false
+        var codeLanguage = ""
+        
+        // Вспомогательная функция для сброса накопившегося обычного текста
+        func flushText() {
+            let joined = currentTextLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !joined.isEmpty {
+                blocks.append(.text(parseInline(joined)))
+            }
+            currentTextLines.removeAll()
+        }
+        
+        // Вспомогательная функция для сброса накопившейся цитаты
+        func flushQuote() {
+            let joined = currentQuoteLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !joined.isEmpty {
+                blocks.append(.quote(parseInline(joined)))
+            }
+            currentQuoteLines.removeAll()
+        }
+        
+        for line in lines {
+            // 1. Блоки кода ( ``` )
+            if line.hasPrefix("```") {
+                if isInsideCodeBlock {
+                    // Закрываем блок кода
+                    blocks.append(.codeBlock(code: currentTextLines.joined(separator: "\n"), language: codeLanguage))
+                    currentTextLines.removeAll()
+                    isInsideCodeBlock = false
+                } else {
+                    // Открываем блок кода
+                    flushText()
+                    flushQuote()
+                    isInsideCodeBlock = true
+                    codeLanguage = String(line.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                continue
+            }
+            
+            // Если мы внутри кода, просто копим строки и игнорируем остальной синтаксис
+            if isInsideCodeBlock {
+                currentTextLines.append(line)
+                continue
+            }
+            
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            
+            // 2. Горизонтальные линии (---)
+            if trimmedLine == "---" || trimmedLine == "***" || trimmedLine == "___" {
+                flushText()
+                flushQuote()
+                blocks.append(.divider)
+                continue
+            }
+            
+            // 3. Заголовки (H1 - H3)
+            if line.hasPrefix("# ") {
+                flushText()
+                flushQuote()
+                blocks.append(.header(text: parseInline(String(line.dropFirst(2))), level: 1))
+                continue
+            } else if line.hasPrefix("## ") {
+                flushText()
+                flushQuote()
+                blocks.append(.header(text: parseInline(String(line.dropFirst(3))), level: 2))
+                continue
+            } else if line.hasPrefix("### ") {
+                flushText()
+                flushQuote()
+                blocks.append(.header(text: parseInline(String(line.dropFirst(4))), level: 3))
+                continue
+            }
+            
+            // 4. Цитаты (>)
+            if line.hasPrefix(">") {
+                flushText()
+                // Убираем символ > и возможный пробел после него
+                let quoteContent = String(line.dropFirst()).trimmingCharacters(in: .whitespaces)
+                currentQuoteLines.append(quoteContent)
+                continue
+            } else {
+                // Если строка не цитата, то сбрасываем накопленные цитаты
+                flushQuote()
+            }
+            
+            // 5. Обычный текст (включая списки *, -, 1.)
+            currentTextLines.append(line)
+        }
+        
+        // В конце цикла не забываем сбросить остатки
+        flushText()
+        flushQuote()
+        
+        return blocks
+    }
+    
+    /// Преобразует строчный Markdown во встроенный в iOS 15 AttributedString, строго сохраняя переносы строк
+    private static func parseInline(_ text: String) -> AttributedString {
+        var options = AttributedString.MarkdownParsingOptions()
+        // ВАЖНО: Только режим inline (сохранение оригинальных переносов \n, чтобы текст не "сбивался в кучу")
+        options.interpretedSyntax = .inlineOnlyPreservingWhitespace
+        
+        if let attrString = try? AttributedString(markdown: text, options: options) {
+            return attrString
+        }
+        return AttributedString(text)
+    }
+}
+
+
+// MARK: - SwiftUI Компоненты Markdown
+
+struct MarkdownView: View {
+    let text: String
+    let textColor: Color
+    
+    var body: some View {
+        let blocks = MarkdownParser.parse(text)
+        
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(0..<blocks.count, id: \.self) { index in
+                switch blocks[index] {
+                case .text(let attrString):
+                    Text(attrString)
+                        .font(.body)
+                        .foregroundColor(textColor)
+                        .tint(textColor == .white ? .white : .blue) // Подстраиваем цвет ссылок
+                        .textSelection(.enabled) // Копирование текста (iOS 15+)
+                    
+                case .header(let attrString, let level):
+                    Text(attrString)
+                        // Динамический размер в зависимости от уровня заголовка
+                        .font(.system(size: level == 1 ? 22 : (level == 2 ? 19 : 17), weight: .bold))
+                        .foregroundColor(textColor)
+                        .tint(textColor == .white ? .white : .blue)
+                        .textSelection(.enabled)
+                        .padding(.top, 6)
+                        .padding(.bottom, 2)
+                    
+                case .quote(let attrString):
+                    HStack(spacing: 12) {
+                        // Вертикальная полоса цитаты
+                        Rectangle()
+                            .fill(textColor.opacity(0.3))
+                            .frame(width: 3)
+                        
+                        Text(attrString)
+                            .font(.body)
+                            .foregroundColor(textColor.opacity(0.8)) // Слегка тусклый цвет для цитат
+                            .tint(textColor == .white ? .white : .blue)
+                            .textSelection(.enabled)
+                    }
+                    .fixedSize(horizontal: false, vertical: true) // Защита от обрезания многострочных цитат
+                    .padding(.vertical, 4)
+                    
+                case .codeBlock(let code, let language):
+                    CodeBlockView(code: code, language: language)
+                        .padding(.vertical, 4)
+                        
+                case .divider:
+                    Divider()
+                        .background(textColor.opacity(0.3))
+                        .padding(.vertical, 8)
+                }
+            }
+        }
+    }
+}
+
+struct CodeBlockView: View {
+    let code: String
+    let language: String
+    @State private var isCopied = false
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Панель заголовка блока кода
+            HStack {
+                Text(language.isEmpty ? "CODE" : language.uppercased())
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundColor(.secondary)
+                
+                Spacer()
+                
+                Button(action: {
+                    UIPasteboard.general.string = code
+                    withAnimation {
+                        isCopied = true
+                    }
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        withAnimation {
+                            isCopied = false
+                        }
+                    }
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                        Text(isCopied ? "Скопировано" : "Копировать")
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(isCopied ? .green : .blue)
+                }
+                .buttonStyle(.borderless)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color(.systemGray5))
+            
+            // Область самого кода с горизонтальным скроллом
+            ScrollView(.horizontal, showsIndicators: true) {
+                Text(code)
+                    .font(.system(size: 13, weight: .regular, design: .monospaced))
+                    .foregroundColor(Color(.label))
+                    .padding(12)
+                    .textSelection(.enabled)
+            }
+            .background(Color(.systemGray6))
+        }
+        .cornerRadius(10)
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color(.systemGray4), lineWidth: 1)
+        )
     }
 }
 
@@ -548,7 +1052,7 @@ struct HistoryView: View {
                                             .lineLimit(1)
                                         
                                         if let lastMsg = session.messages.last {
-                                            Text(lastMsg.content)
+                                            Text(lastMsg.content.isEmpty ? "Файл / Изображение" : lastMsg.content)
                                                 .font(.caption)
                                                 .foregroundColor(.secondary)
                                                 .lineLimit(1)
@@ -596,14 +1100,75 @@ struct SettingsView: View {
     
     @State private var tempKey: String = ""
     @State private var tempModel: String = "gemini-3.5-flash"
+    @State private var tempTemperature: Double = 0.7
+    @State private var tempSystemPrompt: String = ""
+    
+    // Стейты для сохранения системного промпта
+    @State private var showingSavePromptAlert = false
+    @State private var newPromptTitle = ""
     
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("API-КЛЮЧ GEMINI")) {
-                    SecureField("Введите ваш API-ключ", text: $tempKey)
-                        .disableAutocorrection(true)
-                        .autocapitalization(.none)
+                Section(header: Text("API-КЛЮЧ GEMINI"), footer: Text("Бесплатный ключ на aistudio.google.com имеет лимиты: 15 запросов в минуту (RPM), 1500 запросов в день (RPD).")) {
+                    HStack(spacing: 12) {
+                        SecureField("Введите ваш API-ключ", text: $tempKey)
+                            .disableAutocorrection(true)
+                            .autocapitalization(.none)
+                            .onChange(of: tempKey) { _ in
+                                // Сбрасываем статус при ручном изменении текста ключа
+                                viewModel.keyValidationStatus = .unchecked
+                            }
+                        
+                        if viewModel.isCheckingKey {
+                            ProgressView()
+                                .frame(width: 24, height: 24)
+                        } else {
+                            Button(action: {
+                                Task {
+                                    await viewModel.validateApiKey(tempKey)
+                                }
+                            }) {
+                                Image(systemName: "arrow.clockwise.circle.fill")
+                                    .font(.system(size: 22))
+                                    .foregroundColor(.blue)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    
+                    // Вывод статуса проверки ключа
+                    switch viewModel.keyValidationStatus {
+                    case .unchecked:
+                        EmptyView()
+                    case .valid:
+                        HStack {
+                            Image(systemName: "checkmark.shield.fill")
+                                .foregroundColor(.green)
+                            Text("Ключ активен! Ограничения в порядке.")
+                                .font(.footnote)
+                                .foregroundColor(.green)
+                        }
+                        .padding(.top, 2)
+                    case .invalid(let reason):
+                        HStack(alignment: .top) {
+                            Image(systemName: "exclamationmark.shield.fill")
+                                .foregroundColor(.red)
+                            Text(reason)
+                                .font(.footnote)
+                                .foregroundColor(.red)
+                        }
+                        .padding(.top, 2)
+                    case .rateLimited(let reason):
+                        HStack(alignment: .top) {
+                            Image(systemName: "clock.badge.exclamationmark.fill")
+                                .foregroundColor(.orange)
+                            Text(reason)
+                                .font(.footnote)
+                                .foregroundColor(.orange)
+                        }
+                        .padding(.top, 2)
+                    }
                     
                     Link(destination: URL(string: "https://aistudio.google.com/")!) {
                         HStack {
@@ -644,6 +1209,78 @@ struct SettingsView: View {
                     }
                 }
                 
+                Section(header: Text("НАСТРОЙКИ ГЕНЕРАЦИИ")) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("Температура ответа:")
+                            Spacer()
+                            Text(String(format: "%.1f", tempTemperature))
+                                .fontWeight(.bold)
+                        }
+                        Slider(value: $tempTemperature, in: 0.0...2.0, step: 0.1)
+                        Text("Меньше — более точные ответы, больше — более креативные.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                }
+                
+                Section(header: Text("СИСТЕМНЫЙ ПРОМПТ")) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        TextEditor(text: $tempSystemPrompt)
+                            .frame(minHeight: 80)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Color(.systemGray4), lineWidth: 1)
+                            )
+                        Text("Инструкции, определяющие поведение нейросети (роль, стиль общения).")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                    
+                    Button(action: {
+                        newPromptTitle = ""
+                        showingSavePromptAlert = true
+                    }) {
+                        HStack {
+                            Image(systemName: "square.and.arrow.down")
+                            Text("Сохранить текущий промпт")
+                        }
+                    }
+                    .disabled(tempSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                
+                Section(header: Text("СОХРАНЕННЫЕ ПРОМПТЫ")) {
+                    if viewModel.savedPrompts.isEmpty {
+                        Text("Нет сохраненных промптов")
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(viewModel.savedPrompts) { prompt in
+                            Button(action: {
+                                tempSystemPrompt = prompt.text
+                            }) {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(prompt.title)
+                                            .foregroundColor(.primary)
+                                            .font(.system(size: 16, weight: .medium))
+                                        Text(prompt.text)
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "arrow.up.doc")
+                                        .foregroundColor(.blue)
+                                        .font(.system(size: 14))
+                                }
+                            }
+                        }
+                        .onDelete(perform: viewModel.deleteSavedPrompt)
+                    }
+                }
+                
                 Section(footer: Text("Этот ключ и настройки сохраняются только локально на вашем устройстве в зашифрованном виде.")) {
                     Button(action: saveSettings) {
                         Text("Сохранить настройки")
@@ -667,6 +1304,25 @@ struct SettingsView: View {
             .onAppear {
                 tempKey = viewModel.apiKey
                 tempModel = viewModel.selectedModel
+                tempTemperature = viewModel.temperature
+                tempSystemPrompt = viewModel.systemPrompt
+                
+                // Автоматическая фоновая проверка при входе в настройки
+                if !tempKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Task {
+                        await viewModel.validateApiKey(tempKey)
+                    }
+                }
+            }
+            .alert("Сохранить промпт", isPresented: $showingSavePromptAlert) {
+                TextField("Название промпта", text: $newPromptTitle)
+                Button("Отмена", role: .cancel) { }
+                Button("Сохранить") {
+                    let title = newPromptTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Без названия" : newPromptTitle
+                    viewModel.saveNewPrompt(title: title, text: tempSystemPrompt)
+                }
+            } message: {
+                Text("Введите название для сохранения текущего промпта.")
             }
         }
     }
@@ -674,6 +1330,8 @@ struct SettingsView: View {
     private func saveSettings() {
         viewModel.apiKey = tempKey
         viewModel.selectedModel = tempModel
+        viewModel.temperature = tempTemperature
+        viewModel.systemPrompt = tempSystemPrompt
         isPresented = false
     }
 }
@@ -731,7 +1389,8 @@ struct ChatRoomView: View {
                                         .id(message.id)
                                 }
                                 
-                                if viewModel.isLoading {
+                                // Показываем индикатор загрузки только пока не начали получать потоковый ответ (пока баббл модели пуст)
+                                if viewModel.isLoading && (session.messages.last?.role == .user || session.messages.last?.content.isEmpty == true) {
                                     HStack {
                                         ProgressView()
                                             .padding(.trailing, 8)
@@ -976,13 +1635,24 @@ struct ChatRoomView: View {
     }
     
     private func scrollToBottom(proxy: ScrollViewProxy, session: ChatSession) {
-        withAnimation {
-            if viewModel.isLoading {
-                proxy.scrollTo("loadingIndicator", anchor: .bottom)
-            } else if viewModel.errorMessage != nil {
-                proxy.scrollTo("errorIndicator", anchor: .bottom)
-            } else if let lastMessage = session.messages.last {
+        // Проверяем, идет ли прямо сейчас активный посимвольный вывод текста
+        let isActivelyStreaming = viewModel.isTyping && session.messages.last?.role == .model && !(session.messages.last?.content.isEmpty ?? true)
+        
+        if isActivelyStreaming {
+            // Без анимации во время активного стриминга символов для идеального прилипания и устранения дерганий скролла
+            if let lastMessage = session.messages.last {
                 proxy.scrollTo(lastMessage.id, anchor: .bottom)
+            }
+        } else {
+            // С плавной анимацией для остальных случаев (отправка сообщения, загрузка, новые чаты)
+            withAnimation(.easeOut(duration: 0.25)) {
+                if viewModel.errorMessage != nil {
+                    proxy.scrollTo("errorIndicator", anchor: .bottom)
+                } else if viewModel.isLoading && (session.messages.last?.role == .user || session.messages.last?.content.isEmpty == true) {
+                    proxy.scrollTo("loadingIndicator", anchor: .bottom)
+                } else if let lastMessage = session.messages.last {
+                    proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                }
             }
         }
     }
@@ -993,6 +1663,7 @@ struct ChatRoomView: View {
 
 struct MessageBubble: View {
     let message: ChatMessage
+    @State private var isCopied: Bool = false // Стейт для визуального эффекта копирования
     
     var body: some View {
         HStack {
@@ -1008,10 +1679,10 @@ struct MessageBubble: View {
                     }
                     
                     if !message.content.isEmpty {
-                        Text(message.content)
+                        // Для сообщений пользователя используем белый цвет текста Markdown
+                        MarkdownView(text: message.content, textColor: .white)
                             .padding(14)
                             .background(Color.blue)
-                            .foregroundColor(.white)
                             .cornerRadius(18, corners: [.topLeft, .topRight, .bottomLeft])
                     }
                 }
@@ -1026,15 +1697,39 @@ struct MessageBubble: View {
                     
                     if !message.content.isEmpty {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text(LocalizedStringKey(message.content))
-                                .font(.body)
-                                .foregroundColor(.primary)
-                                .textSelection(.enabled)
+                            // Рендеринг текста Gemini с поддержкой Markdown
+                            MarkdownView(text: message.content, textColor: .primary)
                             
-                            Text(message.timestamp, style: .time)
-                                .font(.system(size: 9))
-                                .foregroundColor(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .trailing)
+                            HStack {
+                                // Кнопка копирования сообщения целиком
+                                Button(action: {
+                                    UIPasteboard.general.string = message.content
+                                    withAnimation {
+                                        isCopied = true
+                                    }
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                        withAnimation {
+                                            isCopied = false
+                                        }
+                                    }
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                                        Text(isCopied ? "Скопировано" : "Копировать")
+                                    }
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundColor(isCopied ? .green : .secondary)
+                                }
+                                
+                                Spacer()
+                                
+                                Text(message.timestamp, style: .time)
+                                    .font(.system(size: 9))
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.top, 4)
                         }
                         .padding(14)
                         .background(Color(.secondarySystemBackground))
@@ -1100,7 +1795,7 @@ struct AttachmentBubbleView: View {
 }
 
 
-// MARK: - Вспомогательное расширение для скругления отдельных углов
+// MARK: - Вспомогательные расширения
 
 extension View {
     func cornerRadius(_ radius: CGFloat, corners: UIRectCorner) -> some View {
